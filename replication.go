@@ -112,6 +112,21 @@ func (s *followerReplication) cleanNotify(v *verifyFuture) {
 	s.notifyLock.Unlock()
 }
 
+// IsCaughtUp returns true if the log have been caught up.
+func (s *followerReplication) IsCaughtUp(lastIndex uint64, maxRest int) bool {
+	return s.nextIndex+uint64(maxRest)-1 >= lastIndex
+}
+
+// GetSuffrage is used to get suffrage of peer.
+func (s *followerReplication) GetSuffrage() ServerSuffrage {
+	return s.peer.Suffrage
+}
+
+// SetSuffrage is used to set suffrage of peer.
+func (s *followerReplication) SetSuffrage(suffrage ServerSuffrage) {
+	s.peer.Suffrage = suffrage
+}
+
 // LastContact returns the time of last contact.
 func (s *followerReplication) LastContact() time.Time {
 	s.lastContactLock.RLock()
@@ -130,14 +145,30 @@ func (s *followerReplication) setLastContact() {
 // replicate is a long running routine that replicates log entries to a single
 // follower.
 func (r *Raft) replicate(s *followerReplication) {
+	done := make(chan struct{})
+	defer close(done)
+
 	// Start an async heartbeating routing
-	stopHeartbeat := make(chan struct{})
-	defer close(stopHeartbeat)
-	r.goFunc(func() { r.heartbeat(s, stopHeartbeat) })
+	r.goFunc(func() { r.heartbeat(s, done) })
+
+	// Start a goroutine to handle items from changeToVoterCh
+	changeToVoterCh := make(chan struct{}, 1)
+	r.goFunc(func() {
+		r.changeToVoter(s, changeToVoterCh, done)
+	})
+	defer close(changeToVoterCh)
 
 RPC:
 	shouldStop := false
 	for !shouldStop {
+		// Change to voter
+		if s.peer.Suffrage == Nonvoter && s.IsCaughtUp(r.getLastIndex(), r.conf.MaxAppendEntries) {
+			select {
+			case changeToVoterCh <- struct{}{}:
+			default:
+			}
+		}
+
 		select {
 		case maxIndex := <-s.stopCh:
 			// Make a best effort to replicate up to this index
@@ -388,6 +419,41 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			failures = 0
 			metrics.MeasureSince([]string{"raft", "replication", "heartbeat", string(s.peer.ID)}, start)
 			s.notifyAll(resp.Success)
+		}
+	}
+}
+
+func (r *Raft) changeToVoter(s *followerReplication, ch chan struct{}, stopCh chan struct{}) {
+	var failures uint64
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ch:
+			if s.peer.Suffrage == Voter {
+				return
+			}
+
+			failures = 0
+			prevIndex := r.configurations.latestIndex
+			for {
+				if failures > 0 {
+					select {
+					case <-time.After(backoff(failureWait, failures, maxFailureScale)):
+					case <-stopCh:
+						return
+					}
+				}
+
+				f := r.AddVoter(s.peer.ID, s.peer.Address, prevIndex, 0)
+				if err := f.Error(); err != nil {
+					r.logger.Error("failed to add voter", "peer", s.peer.Address, "error", err)
+					failures++
+					continue
+				}
+
+				return
+			}
 		}
 	}
 }

@@ -652,6 +652,56 @@ func TestRaft_JoinNode_ConfigStore(t *testing.T) {
 
 }
 
+func TestRaft_JoinNonVoter(t *testing.T) {
+	// Make a cluster
+	c := MakeCluster(2, t, nil)
+	defer c.Close()
+
+	// Make a new cluster of 1
+	c1 := MakeClusterNoBootstrap(1, t, nil)
+
+	// Merge clusters
+	c.Merge(c1)
+	c.FullyConnect()
+
+	// Join the new node in
+	future := c.Leader().AddNonvoter(c1.rafts[0].localID, c1.rafts[0].localAddr, 0, 0)
+	if err := future.Error(); err != nil {
+		c.FailNowf("err: %v", err)
+	}
+
+	// Ensure one leader
+	c.EnsureLeader(t, c.Leader().localAddr)
+
+	// Ensure change to voter
+	ensureChangeToVoter := func() error {
+		timer := time.After(1 * time.Second)
+		for {
+			select {
+			case <-timer:
+				fmt.Println(len(c.Leader().configurationChangeCh))
+				return fmt.Errorf("failed to wait for changing to voter")
+			default:
+				for _, s := range c.Leader().configurations.committed.Servers {
+					if s.ID == c1.rafts[0].localID && s.Suffrage == Voter {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	if err := ensureChangeToVoter(); err != nil {
+		c.FailNowf("unexpected error: %v", err)
+	}
+
+	// Check the FSMs
+	c.EnsureSame(t)
+
+	// Check the peers
+	c.EnsureSamePeers(t)
+}
+
 func TestRaft_RemoveFollower(t *testing.T) {
 	// Make a cluster
 	c := MakeCluster(3, t, nil)
